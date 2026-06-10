@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rapidocr-server"
+dynamic = ["version", "dependencies"]
+description = "An unofficial server of RapidOCR API."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "SWHL", email = "liekkaskono@163.com"}, {name = "XJTU-WXY", email = "wxyedward@outlook.com"}]
+urls = {Homepage = "https://github.com/XJTU-WXY/RapidOCRServer", Download = "https://github.com/XJTU-WXY/RapidOCRServer.git"}
+keywords = ["ocr", "text_detection", "text_recognition", "db", "onnxruntime", "paddleocr", "openvino", "rapidocr"]
+classifiers = [
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+requires-python = ">=3.6"
+
+[project.scripts]
+rapidocr_server = "rapidocr_server.main:main"
+
+[tool.setuptools]
+packages = ["rapidocr_server"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+rapidocr_server = ["*.ico", "*.css", "*.js", "*.html"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+version = {attr = "rapidocr_server.__version__"}  
