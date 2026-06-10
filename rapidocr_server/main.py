@@ -64,9 +64,9 @@ def create_app() -> FastAPI:
                 config_path=config_path,
                 idle_timeout_minutes=idle_timeout_minutes,
             )
-            logger.info("OCR engine is ready (config_path=%s)", config_path)
+            logger.info("RapidOCR server is ready (config_path=%s)", config_path)
         except RuntimeError as e:
-            logger.critical("OCR engine initialization failed; cannot start service: %s", e)
+            logger.critical("RapidOCR server initialization failed; cannot start service: %s", e)
             sys.exit(1)
 
     @app.exception_handler(HTTPException)

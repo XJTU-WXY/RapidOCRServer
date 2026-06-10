@@ -1,20 +1,64 @@
 import base64
 import io
 import logging
+import multiprocessing as mp
 import threading
 import time
 from typing import Dict, Optional
 
 import numpy as np
 from PIL import Image, UnidentifiedImageError
-from rapidocr import RapidOCR
 
 from .exceptions import ImageDecodeError, OCRProcessError
 
 logger = logging.getLogger(__name__)
 
 
+def _worker_process(
+    config_path: Optional[str],
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+) -> None:
+    try:
+        from rapidocr import RapidOCR
+        ocr = RapidOCR(config_path=config_path) if config_path else RapidOCR()
+    except Exception as e:
+        result_queue.put({"error": f"Model load failed: {e}"})
+        return
+
+    result_queue.put({"ready": True})
+
+    while True:
+        task = task_queue.get()
+        if task is None: 
+            break
+        try:
+            img_array, kwargs = task
+            res = ocr(img_array, **kwargs)
+
+            if res.boxes is None or res.txts is None or res.scores is None:
+                result_queue.put({"result": {}})
+            else:
+                result_queue.put({
+                    "result": {
+                        i: {
+                            "rec_txt": txt,
+                            "dt_boxes": boxes.tolist(),
+                            "score": float(score),
+                        }
+                        for i, (boxes, txt, score) in enumerate(
+                            zip(res.boxes, res.txts, res.scores)
+                        )
+                    }
+                })
+        except Exception as e:
+            result_queue.put({"error": str(e)})
+
+
+
 class OCREngine:
+    _mp_ctx = mp.get_context("spawn")
+
     def __init__(
         self,
         config_path: Optional[str] = None,
@@ -23,9 +67,10 @@ class OCREngine:
         self._config_path = config_path
         self._idle_timeout_seconds: float = idle_timeout_minutes * 60
         self._lock = threading.RLock()
-        self._ocr: Optional[RapidOCR] = None
+        self._process: Optional[mp.Process] = None
+        self._task_queue: Optional[mp.Queue] = None
+        self._result_queue: Optional[mp.Queue] = None
         self._last_request_time: float = 0.0
-        self._watchdog_thread: Optional[threading.Thread] = None
 
         self._load_model()
 
@@ -38,65 +83,88 @@ class OCREngine:
         else:
             logger.info("Idle auto-unload disabled")
 
-    # ------------------------------------------------------------------
-    # Internal model lifecycle
-    # ------------------------------------------------------------------
-
     def _load_model(self) -> None:
-        logger.info("Loading RapidOCR model (config_path=%s) ...", self._config_path)
+        logger.info("Starting OCR engine worker process (config_path=%s) ...", self._config_path)
+
+        task_queue = self._mp_ctx.Queue()
+        result_queue = self._mp_ctx.Queue()
+
+        process = self._mp_ctx.Process(
+            target=_worker_process,
+            args=(self._config_path, task_queue, result_queue),
+            daemon=True,
+        )
+        process.start()
+
         try:
-            if self._config_path:
-                self._ocr = RapidOCR(config_path=self._config_path)
-            else:
-                self._ocr = RapidOCR()
-            self._last_request_time = time.monotonic()
-            logger.info("RapidOCR model loaded successfully")
-        except Exception as e:
-            logger.exception("Failed to load RapidOCR model")
-            raise RuntimeError(f"Failed to load RapidOCR model: {e}") from e
+            signal = result_queue.get(timeout=180)
+        except Exception:
+            process.terminate()
+            process.join()
+            raise RuntimeError("OCR engine worker process did not respond within 180 s")
+
+        if "error" in signal:
+            process.terminate()
+            process.join()
+            raise RuntimeError(signal["error"])
+
+        self._process = process
+        self._task_queue = task_queue
+        self._result_queue = result_queue
+        self._last_request_time = time.monotonic()
+        logger.info("OCR engine worker process ready (pid=%d)", process.pid)
 
     def _unload_model(self) -> None:
-        if self._ocr is not None:
-            self._ocr = None
-            logger.info("RapidOCR model unloaded due to idle timeout")
+        if self._process is None:
+            return
+
+        pid = self._process.pid
+        try:
+            self._task_queue.put(None)
+            self._process.join(timeout=5)
+
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=5)
+
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join()
+        except Exception as e:
+            logger.warning("Error while terminating OCR engine worker (pid=%d): %s", pid, e)
+        finally:
+            self._process = None
+            self._task_queue = None
+            self._result_queue = None
+            logger.info(
+                "OCR engine worker process (pid=%d) terminated due to inactivity.", pid
+            )
 
     def _ensure_model_loaded(self) -> None:
-        if self._ocr is None:
-            logger.info("Model is not loaded, reloading ...")
+        if self._process is None or not self._process.is_alive():
+            logger.info("OCR engine worker is not running, reloading ...")
             self._load_model()
 
-    # ------------------------------------------------------------------
-    # Watchdog
-    # ------------------------------------------------------------------
-
     def _start_watchdog(self) -> None:
-        """Start the background idle-watchdog thread (daemon so it won't block shutdown)."""
-        self._watchdog_thread = threading.Thread(
+        t = threading.Thread(
             target=self._watchdog_loop,
             name="ocr-idle-watchdog",
             daemon=True,
         )
-        self._watchdog_thread.start()
+        t.start()
 
     def _watchdog_loop(self) -> None:
-        """Poll every 30 s (or half the timeout, whichever is smaller) and unload when idle."""
         poll_interval = min(30.0, self._idle_timeout_seconds / 2)
         while True:
             time.sleep(poll_interval)
             with self._lock:
-                if self._ocr is None:
-                    # Already unloaded; nothing to do until next request reloads it.
+                if self._process is None:
                     continue
                 idle_seconds = time.monotonic() - self._last_request_time
                 if idle_seconds >= self._idle_timeout_seconds:
                     self._unload_model()
 
-    # ------------------------------------------------------------------
-    # Public image helpers
-    # ------------------------------------------------------------------
-
     def decode_image(self, image_data: str) -> Image.Image:
-        """Decode a Base64 string into a PIL.Image."""
         try:
             img_bytes = base64.b64decode(image_data)
             return Image.open(io.BytesIO(img_bytes))
@@ -108,17 +176,12 @@ class OCREngine:
             raise ImageDecodeError(f"Unexpected error while decoding image: {e}") from e
 
     def open_image(self, file_like) -> Image.Image:
-        """Open a PIL.Image from a file-like object."""
         try:
             return Image.open(file_like)
         except UnidentifiedImageError as e:
             raise ImageDecodeError(f"Unrecognized image format: {e}") from e
         except Exception as e:
             raise ImageDecodeError(f"Failed to read uploaded file: {e}") from e
-
-    # ------------------------------------------------------------------
-    # Public OCR entry point
-    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -132,11 +195,13 @@ class OCREngine:
         box_thresh: Optional[float] = None,
         unclip_ratio: Optional[float] = None,
     ) -> Dict:
-        """Run OCR and return a structured result dict."""
         img_array = np.array(image)
 
-        optional_kwargs = {
+        ocr_kwargs = {
             k: v for k, v in {
+                "use_det": use_det,
+                "use_cls": use_cls,
+                "use_rec": use_rec,
                 "return_word_box": return_word_box,
                 "return_single_char_box": return_single_char_box,
                 "text_score": text_score,
@@ -149,28 +214,19 @@ class OCREngine:
             self._ensure_model_loaded()
             self._last_request_time = time.monotonic()
 
+            self._task_queue.put((img_array, ocr_kwargs))
             try:
-                ocr_res = self._ocr(
-                    img_array,
-                    use_det=use_det,
-                    use_cls=use_cls,
-                    use_rec=use_rec,
-                    **optional_kwargs,
-                )
+                response = self._result_queue.get(timeout=60)
             except Exception as e:
-                logger.exception("Error during OCR inference")
-                raise OCRProcessError(message="OCR inference failed", detail=str(e)) from e
+                raise OCRProcessError(
+                    message="OCR engine worker did not respond within 60 s",
+                    detail=str(e),
+                )
 
-        if ocr_res.boxes is None or ocr_res.txts is None or ocr_res.scores is None:
-            return {}
-
-        return {
-            i: {
-                "rec_txt": txt,
-                "dt_boxes": boxes.tolist(),
-                "score": float(score),
-            }
-            for i, (boxes, txt, score) in enumerate(
-                zip(ocr_res.boxes, ocr_res.txts, ocr_res.scores)
+        if "error" in response:
+            raise OCRProcessError(
+                message="OCR engine inference failed",
+                detail=response["error"],
             )
-        }
+
+        return response["result"]
